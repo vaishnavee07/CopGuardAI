@@ -17,39 +17,74 @@ export default function LocationInterceptor() {
         setLoading(true);
         setError('');
 
+        // Check token first
+        const token = localStorage.getItem('token');
+        if (!token) {
+            setError('⚠️ No login token found. Please log in first, then try enabling location.');
+            setLoading(false);
+            return;
+        }
+
         if (!navigator.geolocation) {
             setError('Geolocation is not supported by your browser.');
             setLoading(false);
             return;
         }
 
+        console.log('📍 Requesting geolocation from browser...');
+
         navigator.geolocation.getCurrentPosition(
             async (position) => {
                 const { latitude, longitude } = position.coords;
+                console.log('✓ Got coordinates:', latitude, longitude);
+                
                 localStorage.setItem('lat', latitude.toString());
                 localStorage.setItem('lon', longitude.toString());
 
                 try {
-                    await fetch(`${import.meta.env.VITE_API_URL}/api/auth/update-location`, {
+                    console.log('Sending location to backend...');
+                    const response = await fetch(`${import.meta.env.VITE_API_URL}/api/auth/update-location`, {
                         method: 'POST',
                         headers: {
                             'Content-Type': 'application/json',
-                            'Authorization': `Bearer ${localStorage.getItem('token')}`
+                            'Authorization': `Bearer ${token}`
                         },
                         body: JSON.stringify({ lat: latitude, lng: longitude })
                     });
 
+                    if (!response.ok) {
+                        const errorText = await response.text();
+                        console.error('Backend error:', response.status, errorText);
+                        throw new Error(`Server error: ${response.status}`);
+                    }
+
+                    console.log('✓ Location saved to backend');
                     localStorage.setItem('location_granted', 'true');
                     const role = localStorage.getItem('role');
                     navigate(role === 'admin' ? '/dashboard' : '/worker-dashboard');
                 } catch (err) {
-                    setError('Failed to sync location to server. Please try again.');
+                    console.error('Location sync error:', err);
+                    setError('Failed to sync location to server. Try Dev Mode.');
                     setLoading(false);
                 }
             },
             (geoError) => {
-                setError('Location access is required. You cannot use CopGuard without it.');
+                console.error('Geolocation error:', geoError.code, geoError.message);
+                if (geoError.code === 1) {
+                    setError('❌ Browser blocked location. Clear permissions: Click lock icon → Site settings → Location → Allow');
+                } else if (geoError.code === 2) {
+                    setError('📍 Location unavailable. Check your device location services.');
+                } else if (geoError.code === 3) {
+                    setError('⏱️ Location request timed out. Try again.');
+                } else {
+                    setError('Location access is required. Click the lock icon in the address bar and allow location.');
+                }
                 setLoading(false);
+            },
+            {
+                enableHighAccuracy: false,
+                timeout: 10000,
+                maximumAge: 0
             }
         );
     };
