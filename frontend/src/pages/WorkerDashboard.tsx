@@ -1,8 +1,10 @@
 import { useState, useEffect } from 'react';
-import { Activity, ShieldAlert, FileText, MapPin, CheckCircle, AlertTriangle, Clock } from 'lucide-react';
+import { Activity, ShieldAlert, FileText, MapPin, CheckCircle, AlertTriangle, Clock, Zap } from 'lucide-react';
 import { MapContainer, TileLayer, Marker, Popup } from 'react-leaflet';
 import L from 'leaflet';
 import { getCityFromCoords } from '../utils/geocode';
+import AISafetyMonitor from '../components/AISafetyMonitor';
+import MyClaimsPanel from '../components/MyClaimsPanel';
 
 // Fix Leaflet icon in Vite
 delete (L.Icon.Default.prototype as any)._getIconUrl;
@@ -27,6 +29,45 @@ export default function WorkerDashboard() {
     const [myPos, setMyPos] = useState<{ lat: number; lng: number } | null>(null);
     const [myCity, setMyCity] = useState('Locating...');
     const [lastSeen, setLastSeen] = useState<Date | null>(null);
+    const [simulatingEmergency, setSimulatingEmergency] = useState(false);
+    const [emergencyMessage, setEmergencyMessage] = useState('');
+
+    const simulateEmergency = async () => {
+        try {
+            setSimulatingEmergency(true);
+            const token = localStorage.getItem('token');
+            const userStr = localStorage.getItem('user');
+            if (!userStr) return;
+
+            const user = JSON.parse(userStr);
+
+            const response = await fetch(
+                `${import.meta.env.VITE_API_URL}/api/worker/simulate-emergency`,
+                {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${token}`,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        location_lat: myPos?.lat || 20.5937,
+                        location_lng: myPos?.lng || 78.9629
+                    })
+                }
+            );
+
+            if (response.ok) {
+                const data = await response.json();
+                setEmergencyMessage(`Emergency Simulated: Claim ${data.claim_id} created with risk score ${data.risk_score}`);
+                setTimeout(() => setEmergencyMessage(''), 5000);
+            }
+        } catch (err) {
+            console.error('Error simulating emergency:', err);
+            setEmergencyMessage('Failed to simulate emergency');
+        } finally {
+            setSimulatingEmergency(false);
+        }
+    };
 
     useEffect(() => {
         const fetchMyClaims = async () => {
@@ -81,11 +122,28 @@ export default function WorkerDashboard() {
                     <h2 className="text-2xl font-bold text-white tracking-wide uppercase">Worker Dashboard</h2>
                     <p className="text-gray-400 mt-1">Your personal activity and trust metrics.</p>
                 </div>
-                <div className="flex items-center space-x-2 bg-green-500/10 border border-green-500/20 px-4 py-2 rounded-lg">
-                    <MapPin className="text-green-500 w-5 h-5" />
-                    <span className="text-green-500 font-medium text-sm">Location Services Active</span>
+                <div className="flex items-center space-x-4">
+                    <div className="flex items-center space-x-2 bg-green-500/10 border border-green-500/20 px-4 py-2 rounded-lg">
+                        <MapPin className="text-green-500 w-5 h-5" />
+                        <span className="text-green-500 font-medium text-sm">Location Services Active</span>
+                    </div>
+                    <button
+                        onClick={simulateEmergency}
+                        disabled={simulatingEmergency}
+                        className="bg-red-600 hover:bg-red-700 disabled:bg-red-800 text-white px-4 py-2 rounded-lg font-medium text-sm flex items-center gap-2 transition-colors"
+                    >
+                        <Zap className="w-4 h-4" />
+                        {simulatingEmergency ? 'Simulating...' : 'Simulate Emergency'}
+                    </button>
                 </div>
             </div>
+
+            {emergencyMessage && (
+                <div className="bg-red-500/10 border border-red-500/30 rounded-lg p-4 text-red-300 flex items-center gap-3">
+                    <AlertTriangle className="w-5 h-5 flex-shrink-0" />
+                    <span>{emergencyMessage}</span>
+                </div>
+            )}
 
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
                 {/* Fraud Score */}
@@ -129,6 +187,9 @@ export default function WorkerDashboard() {
                     )}
                 </div>
             </div>
+
+            {/* AI Safety Monitor Section */}
+            <AISafetyMonitor />
 
             {/* My Location Mini-Map */}
             <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
@@ -182,27 +243,8 @@ export default function WorkerDashboard() {
                 )}
             </div>
 
-            {/* Claims List */}
-            <div className="bg-gray-900 border border-gray-800 rounded-xl p-6">
-                <h3 className="text-gray-400 font-medium uppercase text-xs tracking-wider mb-6">My Claims</h3>
-                <div className="space-y-3">
-                    {claims.map((claim) => (
-                        <div key={claim.id} className="bg-gray-950 rounded-lg p-4 border border-gray-800 flex items-center justify-between hover:border-gray-700 transition-colors">
-                            <div className="flex items-center space-x-4">
-                                <div className="bg-gray-900 text-gray-400 px-3 py-1.5 rounded font-mono text-sm border border-gray-800">{claim.id}</div>
-                                <div className="text-sm text-gray-500">{new Date(claim.timestamp).toLocaleString()}</div>
-                            </div>
-                            <div className={`px-3 py-1 text-xs font-bold rounded uppercase ${(claim.gap_finder?.fraud_score > 60) ? 'bg-red-500/10 text-red-500 border border-red-500/20' :
-                                    (claim.gap_finder?.fraud_score > 30) ? 'bg-yellow-500/10 text-yellow-500 border border-yellow-500/20' :
-                                        'bg-green-500/10 text-green-500 border border-green-500/20'
-                                }`}>
-                                Score: {claim.gap_finder ? claim.gap_finder.fraud_score : 'PENDING'}
-                            </div>
-                        </div>
-                    ))}
-                    {claims.length === 0 && <div className="text-gray-500 text-sm py-4">You have no recorded claims.</div>}
-                </div>
-            </div>
+            {/* My Claims Panel with Filters */}
+            <MyClaimsPanel />
         </div>
     );
 }

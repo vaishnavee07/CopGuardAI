@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { AlertTriangle, CheckCircle, ShieldAlert, Clock, Activity, Search } from 'lucide-react';
 import { motion } from 'framer-motion';
+import AIClaimsPanel from '../components/AIClaimsPanel';
 
 export interface Claim {
   id: string;
@@ -177,6 +178,11 @@ export default function Dashboard() {
             ))
           )}
         </div>
+      </div>
+
+      {/* AI Autonomous Claims Section */}
+      <div className="mt-12">
+        <AIClaimsPanel />
       </div>
     </div>
   );

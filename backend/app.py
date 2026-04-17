@@ -16,8 +16,15 @@ app.config['SECRET_KEY'] = os.getenv('JWT_SECRET', 'super-secret-copguard-key')
 # Enable CORS for the frontend port
 CORS(app)
 
-from db import init_db, get_db_connection, subscribe_user, is_subscription_active
+from db import (
+    init_db, get_db_connection, subscribe_user, is_subscription_active,
+    create_ai_claim, get_all_ai_claims, get_ai_claim_by_id, get_pending_ai_claims,
+    update_ai_claim_status, get_claims_by_worker, upsert_worker_risk, get_worker_risk,
+    check_duplicate_claim
+)
 from premium_engine import calculate_premium
+from claims_agent import process_worker_state_autonomously
+from agentic_engine import process_worker_event, simulate_ai_trigger
 
 # Initialize DB at startup
 init_db()
@@ -139,34 +146,51 @@ def worker_login():
 @app.route('/api/auth/worker/register', methods=['POST'])
 def worker_register():
     data = request.json
-    full_name = data.get('full_name')
-    phone_number = data.get('phone_number')
-    password = data.get('password')
+    full_name = data.get('full_name', '').strip()
+    phone_number = str(data.get('phone_number', '')).strip()
+    password = data.get('password', '').strip()
     age = data.get('age')
     
+    # Validate full name
+    if not full_name:
+        return jsonify({'status': 'error', 'message': 'Full name is required'}), 400
+    
+    # Validate password
+    if not password or len(password) < 6:
+        return jsonify({'status': 'error', 'message': 'Password must be at least 6 characters'}), 400
+    
+    # Validate age
     try:
         age_int = int(age)
         if age_int < 18 or age_int > 60:
-            return jsonify({'status': 'error', 'message': 'Age must be strictly between 18 and 60'}), 400
+            return jsonify({'status': 'error', 'message': 'Age must be between 18 and 60'}), 400
     except (ValueError, TypeError):
         return jsonify({'status': 'error', 'message': 'Valid age is required'}), 400
     
-    if len(str(phone_number)) != 10:
+    # Validate phone number (remove any non-digits, then check length)
+    phone_digits = ''.join(filter(str.isdigit, phone_number))
+    if len(phone_digits) != 10:
         return jsonify({'status': 'error', 'message': 'Phone number must be exactly 10 digits'}), 400
-        
-    hashed_pw = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
     
-    conn = get_db_connection()
+    # Initialize conn to None to prevent UnboundLocalError
+    conn = None
     try:
+        hashed_pw = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+
+        conn = get_db_connection()
         conn.execute("INSERT INTO users (full_name, age, phone_number, password, role) VALUES (?, ?, ?, ?, 'worker')",
-                     (full_name, age_int, phone_number, hashed_pw))
+                     (full_name, age_int, phone_digits, hashed_pw))
         conn.commit()
-    except Exception as e:
         conn.close()
-        return jsonify({'status': 'error', 'message': 'Phone number already exists'}), 400
-    conn.close()
-    
-    return jsonify({'status': 'success', 'message': 'Registration successful'})
+        
+        return jsonify({'status': 'success', 'message': 'Registration successful'})
+    except Exception as e:
+        if conn:
+            conn.close()
+        error_msg = str(e).lower()
+        if 'unique' in error_msg or 'phone_number' in error_msg:
+            return jsonify({'status': 'error', 'message': 'Phone number already registered'}), 400
+        return jsonify({'status': 'error', 'message': f'Registration failed: {str(e)}'}), 400
 
 @app.route('/api/auth/me', methods=['GET'])
 @token_required
@@ -617,9 +641,16 @@ def get_worker_status(user_id):
     # Not active
     return jsonify({"status": "idle", "trigger": {"active": False}}), 200
 
+# =====================================================================
+# WORKER STATE TRACKING FOR AUTONOMOUS AGENT
+# =====================================================================
+
+# Track worker history for movement and inactivity calculations
+WORKER_STATE = {}  # { user_id: { "prev_lat", "prev_lng", "last_update", "inactivity_start", ... } }
+
 @app.route('/api/worker/location/<user_id>', methods=['GET'])
 def get_worker_location(user_id):
-    """FEATURE 4: Worker Location Simulation (Enhanced with Feature 2 & 4 & 5)"""
+    """FEATURE 4: Worker Location Simulation with Agentic AI Claims Processing"""
     user_id = str(user_id)
     
     if user_id not in ACTIVE_WORKERS:
@@ -638,7 +669,109 @@ def get_worker_location(user_id):
     curr_lat = round(route["current_lat"], 5)
     curr_lng = round(route["current_lng"], 5)
 
-    # FEATURE 2: Auto Trigger Check Hook
+    # ════════════════════════════════════════════════════════════════
+    # AGENTIC AI: AUTONOMOUS CLAIM PROCESSING
+    # ════════════════════════════════════════════════════════════════
+    
+    # Initialize worker state if not present
+    if user_id not in WORKER_STATE:
+        WORKER_STATE[user_id] = {
+            "prev_lat": curr_lat,
+            "prev_lng": curr_lng,
+            "last_update": datetime.utcnow(),
+            "prev_update": datetime.utcnow(),
+            "inactivity_start": None
+        }
+    
+    worker_state_record = WORKER_STATE[user_id]
+    now = datetime.utcnow()
+    time_delta = (now - worker_state_record["last_update"]).total_seconds()
+    
+    # Calculate movement metrics
+    import math
+    lat_diff = curr_lat - worker_state_record["prev_lat"]
+    lng_diff = curr_lng - worker_state_record["prev_lng"]
+    distance_m = _haversine_m(
+        worker_state_record["prev_lat"], 
+        worker_state_record["prev_lng"],
+        curr_lat, 
+        curr_lng
+    )
+    
+    # Calculate inactivity
+    if distance_m < 10:  # Less than 10m movement
+        if worker_state_record["inactivity_start"] is None:
+            worker_state_record["inactivity_start"] = now
+        inactivity_minutes = (now - worker_state_record["inactivity_start"]).total_seconds() / 60
+    else:
+        worker_state_record["inactivity_start"] = None
+        inactivity_minutes = 0
+    
+    # Update state
+    worker_state_record["prev_lat"] = curr_lat
+    worker_state_record["prev_lng"] = curr_lng
+    worker_state_record["prev_update"] = worker_state_record["last_update"]
+    worker_state_record["last_update"] = now
+    
+    # Prepare data for agentic processing
+    movement_data = {
+        "distance_traveled_m": distance_m,
+        "duration_seconds": time_delta,
+        "speed_kmh": (distance_m / max(time_delta, 1)) * 3.6
+    }
+    
+    # Fetch weather data for current location
+    weather_data = None
+    try:
+        api_key = os.getenv("OPENWEATHERMAP_API_KEY")
+        if api_key and api_key != "YOUR_OPENWEATHERMAP_API_KEY_HERE":
+            url = f"https://api.openweathermap.org/data/2.5/weather?lat={curr_lat}&lon={curr_lng}&appid={api_key}"
+            res = requests.get(url, timeout=5)
+            w = res.json()
+            weather_data = {
+                "condition": w.get('weather', [{}])[0].get('main', 'Unknown'),
+                "description": w.get('weather', [{}])[0].get('description', 'Unknown'),
+                "temp_c": round(w.get('main', {}).get('temp', 0) - 273.15, 1),
+                "is_storm": any(
+                    keyword in str(w.get('weather', [{}])[0].get('main', '')).lower()
+                    for keyword in ['thunderstorm', 'tornado', 'rain', 'snow']
+                )
+            }
+    except Exception as e:
+        print(f"[WEATHER FETCH] Error for worker {user_id}: {e}")
+    
+    # Get actual user_id from database to link to worker
+    try:
+        actual_user_id = int(user_id) if user_id.isdigit() else None
+    except:
+        actual_user_id = None
+    
+    # Process autonomous claim if conditions warrant it
+    agent_result = None
+    claim_triggered = False
+    
+    if actual_user_id:
+        try:
+            agent_result = process_worker_state_autonomously(
+                worker_id=f"W-{user_id}",
+                user_id=actual_user_id,
+                location=(curr_lat, curr_lng),
+                movement_data=movement_data,
+                weather_data=weather_data,
+                inactivity_minutes=inactivity_minutes
+            )
+            
+            claim_triggered = agent_result.get("claim_triggered", False)
+            
+            if claim_triggered:
+                print(f"[AUTONOMOUS CLAIM] Generated for worker {user_id}: {agent_result.get('claim_id')}")
+                print(f"  Signals: {agent_result.get('signals')}")
+                print(f"  Confidence: {agent_result.get('confidence')}%")
+        
+        except Exception as e:
+            print(f"[AGENT ERROR] Processing worker {user_id}: {e}")
+
+    # FEATURE 2: Auto Trigger Check Hook (existing rain-based system)
     trigger_flag = False
     condition_str = "clear"
 
@@ -666,13 +799,26 @@ def get_worker_location(user_id):
             # FEATURE 4: Check Logging
             print(f"[CHECK] Worker {user_id} → No risk detected")
 
-    return jsonify({
+    response = {
         "lat": curr_lat,
         "lng": curr_lng,
         "status": "moving",
         "trigger": trigger_flag,
         "condition": condition_str
-    }), 200
+    }
+    
+    # Include agent status in response
+    if agent_result:
+        response["agent"] = {
+            "claim_triggered": claim_triggered,
+            "claim_id": agent_result.get("claim_id"),
+            "distress_detected": agent_result.get("distress_detected"),
+            "confidence": agent_result.get("confidence"),
+            "signals": agent_result.get("signals", []),
+            "action": agent_result.get("action_taken")
+        }
+
+    return jsonify(response), 200
 # =====================================================================
 # STEP 2: Rain Trigger Engine (Parametric Event Detection)
 # =====================================================================
@@ -1002,6 +1148,496 @@ Return ONLY this JSON with no markdown or extra text:
             "verdict": "medium",
             "reason": "AI analysis skipped due to error. Manual review recommended."
         }
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ADMIN API: AUTONOMOUS AI CLAIMS MANAGEMENT
+# ═══════════════════════════════════════════════════════════════════════════
+
+@app.route('/api/admin/claims', methods=['GET'])
+@token_required
+def get_admin_claims(user_id, role):
+    """Get all AI-generated autonomous claims."""
+    if role != 'admin':
+        return jsonify({'status': 'error', 'message': 'Admin access required'}), 403
+    
+    try:
+        claims = get_all_ai_claims()
+        
+        # Enrich with worker details
+        enriched_claims = []
+        for claim in claims:
+            enriched = dict(claim)
+            # Format location
+            enriched['location'] = {
+                'lat': claim['location_lat'],
+                'lng': claim['location_lng']
+            }
+            enriched_claims.append(enriched)
+        
+        return jsonify({
+            'status': 'success',
+            'total': len(enriched_claims),
+            'claims': enriched_claims
+        }), 200
+    
+    except Exception as e:
+        print(f"[ERROR] Getting admin claims: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@app.route('/api/admin/claims/pending', methods=['GET'])
+@token_required
+def get_pending_claims(user_id, role):
+    """Get only pending claims awaiting admin review."""
+    if role != 'admin':
+        return jsonify({'status': 'error', 'message': 'Admin access required'}), 403
+    
+    try:
+        claims = get_pending_ai_claims()
+        
+        enriched_claims = []
+        for claim in claims:
+            enriched = dict(claim)
+            enriched['location'] = {
+                'lat': claim['location_lat'],
+                'lng': claim['location_lng']
+            }
+            enriched_claims.append(enriched)
+        
+        return jsonify({
+            'status': 'success',
+            'pending_count': len(enriched_claims),
+            'claims': enriched_claims
+        }), 200
+    
+    except Exception as e:
+        print(f"[ERROR] Getting pending claims: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@app.route('/api/admin/claims/<claim_id>', methods=['GET'])
+@token_required
+def get_single_ai_claim(user_id, role, claim_id):
+    """Get details of a specific AI-generated claim."""
+    if role != 'admin':
+        return jsonify({'status': 'error', 'message': 'Admin access required'}), 403
+    
+    try:
+        claim = get_ai_claim_by_id(claim_id)
+        
+        if not claim:
+            return jsonify({'status': 'error', 'message': 'Claim not found'}), 404
+        
+        # Enrich with location
+        claim_data = dict(claim)
+        claim_data['location'] = {
+            'lat': claim['location_lat'],
+            'lng': claim['location_lng']
+        }
+        
+        # Parse detection signals if JSON
+        if claim['detection_signals']:
+            try:
+                claim_data['detection_signals_parsed'] = json.loads(claim['detection_signals'])
+            except:
+                claim_data['detection_signals_parsed'] = claim['detection_signals']
+        
+        return jsonify({
+            'status': 'success',
+            'claim': claim_data
+        }), 200
+    
+    except Exception as e:
+        print(f"[ERROR] Getting claim {claim_id}: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@app.route('/api/admin/claims/<claim_id>/approve', methods=['POST'])
+@token_required
+def approve_claim(user_id, role, claim_id):
+    """Admin approves a pending claim for insurance payout."""
+    if role != 'admin':
+        return jsonify({'status': 'error', 'message': 'Admin access required'}), 403
+    
+    try:
+        data = request.json or {}
+        admin_notes = data.get('notes', '')
+        
+        # Update claim status
+        updated_claim = update_ai_claim_status(claim_id, 'approved', admin_notes)
+        
+        if not updated_claim:
+            return jsonify({'status': 'error', 'message': 'Claim not found'}), 404
+        
+        # Log approval
+        print(f"[CLAIM APPROVED] {claim_id} by admin {user_id}")
+        
+        return jsonify({
+            'status': 'success',
+            'message': 'Claim approved successfully',
+            'claim': dict(updated_claim)
+        }), 200
+    
+    except Exception as e:
+        print(f"[ERROR] Approving claim {claim_id}: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@app.route('/api/admin/claims/<claim_id>/reject', methods=['POST'])
+@token_required
+def reject_claim(user_id, role, claim_id):
+    """Admin rejects a pending claim."""
+    if role != 'admin':
+        return jsonify({'status': 'error', 'message': 'Admin access required'}), 403
+    
+    try:
+        data = request.json or {}
+        admin_notes = data.get('notes', 'No reason provided')
+        
+        # Update claim status
+        updated_claim = update_ai_claim_status(claim_id, 'rejected', admin_notes)
+        
+        if not updated_claim:
+            return jsonify({'status': 'error', 'message': 'Claim not found'}), 404
+        
+        # Log rejection
+        print(f"[CLAIM REJECTED] {claim_id} by admin {user_id}")
+        
+        return jsonify({
+            'status': 'success',
+            'message': 'Claim rejected',
+            'claim': dict(updated_claim)
+        }), 200
+    
+    except Exception as e:
+        print(f"[ERROR] Rejecting claim {claim_id}: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@app.route('/api/admin/claims/worker/<worker_id>', methods=['GET'])
+@token_required
+def get_admin_worker_claims(user_id, role, worker_id):
+    """Get all AI-generated claims for a specific worker."""
+    if role != 'admin':
+        return jsonify({'status': 'error', 'message': 'Admin access required'}), 403
+    
+    try:
+        claims = get_claims_by_worker(worker_id)
+        
+        enriched_claims = []
+        for claim in claims:
+            enriched = dict(claim)
+            enriched['location'] = {
+                'lat': claim['location_lat'],
+                'lng': claim['location_lng']
+            }
+            enriched_claims.append(enriched)
+        
+        return jsonify({
+            'status': 'success',
+            'worker_id': worker_id,
+            'claim_count': len(enriched_claims),
+            'claims': enriched_claims
+        }), 200
+    
+    except Exception as e:
+        print(f"[ERROR] Getting claims for worker {worker_id}: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@app.route('/api/admin/claims/stats', methods=['GET'])
+@token_required
+def get_claims_stats(user_id, role):
+    """Get statistics on AI-generated claims."""
+    if role != 'admin':
+        return jsonify({'status': 'error', 'message': 'Admin access required'}), 403
+    
+    try:
+        all_claims = get_all_ai_claims()
+        pending = [c for c in all_claims if c['status'] == 'pending']
+        approved = [c for c in all_claims if c['status'] == 'approved']
+        rejected = [c for c in all_claims if c['status'] == 'rejected']
+        
+        # Group by condition
+        conditions = {}
+        for claim in all_claims:
+            condition = claim.get('distress_condition', 'unknown')
+            conditions[condition] = conditions.get(condition, 0) + 1
+        
+        return jsonify({
+            'status': 'success',
+            'total_claims': len(all_claims),
+            'pending': len(pending),
+            'approved': len(approved),
+            'rejected': len(rejected),
+            'conditions': conditions,
+            'approval_rate': round(len(approved) / max(len(approved) + len(rejected), 1) * 100, 2)
+        }), 200
+    
+    except Exception as e:
+        print(f"[ERROR] Getting claims stats: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# AGENTIC AI - WORKER RISK MONITORING & AUTO-CLAIM TRIGGERING
+# All claims processing now routes through agentic_engine.py
+# ════════════════════════════════════════════════════════════════════════════
+
+@app.route('/api/worker/<int:worker_id>/risk', methods=['GET'])
+@token_required
+def get_worker_risk_status(user_id, role, worker_id):
+    """Get current risk score and status for a worker."""
+    # For demo, check if user is requesting their own risk
+    if user_id != worker_id and role != 'admin':
+        return jsonify({'status': 'error', 'message': 'Access denied'}), 403
+    
+    # Try to fetch from database
+    risk_data = get_worker_risk(worker_id)
+    
+    if risk_data:
+        import json
+        reasons = json.loads(risk_data.get('reasons', '[]')) if isinstance(risk_data.get('reasons'), str) else risk_data.get('reasons', [])
+        return jsonify({
+            'status': 'success',
+            'risk_score': risk_data['current_risk_score'],
+            'risk_level': risk_data['risk_level'],
+            'ai_status': risk_data['ai_status'],
+            'reasons': reasons,
+            'updated_at': risk_data['updated_at']
+        }), 200
+    
+    # Default safe status
+    return jsonify({
+        'status': 'success',
+        'risk_score': 0,
+        'risk_level': 'LOW',
+        'ai_status': 'SAFE',
+        'reasons': [],
+        'updated_at': datetime.utcnow().isoformat()
+    }), 200
+
+
+@app.route('/api/worker/<int:worker_id>/risk/update', methods=['POST'])
+@token_required
+def update_worker_risk(user_id, role, worker_id):
+    """Update worker risk score with various signals via Agentic AI pipeline."""
+    data = request.json
+    
+    # Extract signals
+    inactivity_minutes = data.get('inactivity_minutes', 0)
+    has_movement_anomaly = data.get('has_movement_anomaly', False)
+    is_in_danger_zone = data.get('is_in_danger_zone', False)
+    location_lat = data.get('location_lat', 0.0)
+    location_lng = data.get('location_lng', 0.0)
+    
+    # Route through Agentic AI processing pipeline
+    result = process_worker_event(
+        worker_id=worker_id,
+        user_id=worker_id,
+        location_lat=location_lat,
+        location_lng=location_lng,
+        inactivity_minutes=inactivity_minutes,
+        has_movement_anomaly=has_movement_anomaly,
+        is_in_danger_zone=is_in_danger_zone
+    )
+    
+    if result['status'] == 'error':
+        return jsonify(result), 500
+    
+    return jsonify({
+        'status': 'success',
+        'risk_score': result['risk_score'],
+        'risk_level': result['risk_level'],
+        'ai_status': result['ai_status'],
+        'reasons': result['risk_factors'],
+        'claim_triggered': result['claim_triggered'],
+        'claim_id': result['claim_id'],
+        'decision': result['decision'],
+        'message': 'AI processing complete' if not result['claim_triggered'] else 'Emergency detected. AI initiated insurance claim...'
+    }), 200
+
+
+@app.route('/api/worker/<int:worker_id>/claims', methods=['GET'])
+@token_required
+def get_worker_claims(user_id, role, worker_id):
+    """Get all claims for a specific worker with optional filtering."""
+    # Ensure user can only see their own claims unless admin
+    if user_id != worker_id and role != 'admin':
+        return jsonify({'status': 'error', 'message': 'Access denied'}), 403
+    
+    status_filter = request.args.get('status', 'ALL').upper()
+    
+    # Fetch all claims for this worker
+    all_claims = get_claims_by_worker(f"W-{worker_id}")
+    
+    # Apply status filter
+    if status_filter == 'ALL':
+        filtered_claims = all_claims
+    elif status_filter in ['PENDING', 'SENT', 'REJECTED']:
+        filtered_claims = [c for c in all_claims if c.get('status') == status_filter]
+    else:
+        return jsonify({'status': 'error', 'message': 'Invalid status filter'}), 400
+    
+    # Format response
+    claims_list = []
+    for claim in filtered_claims:
+        claims_list.append({
+            'claim_id': claim.get('claim_id'),
+            'timestamp': claim.get('created_at'),
+            'risk_score': claim.get('risk_score', claim.get('ai_confidence', 0)),
+            'status': claim.get('status'),
+            'reason': claim.get('reason'),
+            'location': {
+                'lat': claim.get('location_lat'),
+                'lng': claim.get('location_lng')
+            }
+        })
+    
+    return jsonify({
+        'status': 'success',
+        'filter': status_filter,
+        'total': len(claims_list),
+        'claims': claims_list
+    }), 200
+
+
+@app.route('/api/claims/auto-trigger', methods=['POST'])
+@token_required
+def auto_trigger_claim(user_id, role):
+    """Internally called when AI detects high risk and needs to trigger a claim."""
+    data = request.json
+    
+    worker_id = data.get('worker_id')
+    risk_score = data.get('risk_score', 75)
+    reasons = data.get('reasons', [])
+    location_lat = data.get('location_lat', 0)
+    location_lng = data.get('location_lng', 0)
+    
+    # Prevent duplicates
+    duplicate = check_duplicate_claim(user_id, time_window_minutes=5)
+    if duplicate:
+        return jsonify({
+            'status': 'success',
+            'message': 'Duplicate claim prevented',
+            'claim_id': duplicate['claim_id']
+        }), 200
+    
+    import json
+    # Create the claim
+    claim = create_ai_claim(
+        user_id=user_id,
+        worker_id=worker_id,
+        location_lat=location_lat,
+        location_lng=location_lng,
+        reason="; ".join(reasons) if isinstance(reasons, list) else reasons,
+        distress_condition="AI_EMERGENCY_TRIGGER",
+        ai_confidence=min(100, risk_score),
+        detection_signals=json.dumps(reasons) if isinstance(reasons, list) else reasons
+    )
+    
+    return jsonify({
+        'status': 'success',
+        'claim_id': claim['claim_id'],
+        'message': 'Emergency claim auto-triggered'
+    }), 201
+
+
+@app.route('/api/claims/<claim_id>/status', methods=['PUT'])
+@token_required
+def update_claim_status(user_id, role, claim_id):
+    """Update claim status (PENDING -> SENT/REJECTED)."""
+    if role != 'admin':
+        return jsonify({'status': 'error', 'message': 'Admin access required'}), 403
+    
+    data = request.json
+    new_status = data.get('status', '').upper()
+    admin_notes = data.get('admin_notes', '')
+    
+    if new_status not in ['SENT', 'REJECTED']:
+        return jsonify({'status': 'error', 'message': 'Invalid status. Must be SENT or REJECTED'}), 400
+    
+    # Update the claim
+    updated_claim = update_ai_claim_status(claim_id, new_status, admin_notes)
+    
+    if not updated_claim:
+        return jsonify({'status': 'error', 'message': 'Claim not found'}), 404
+    
+    return jsonify({
+        'status': 'success',
+        'claim_id': claim_id,
+        'new_status': new_status,
+        'message': f'Claim status updated to {new_status}'
+    }), 200
+
+
+@app.route('/api/worker/simulate-emergency', methods=['POST'])
+@token_required
+def simulate_emergency(user_id, role):
+    """Simulate emergency via Agentic AI pipeline for demo purposes."""
+    data = request.json if request.json else {}
+    location_lat = data.get('location_lat', 20.5937)
+    location_lng = data.get('location_lng', 78.9629)
+    
+    # Route through Agentic AI pipeline
+    result = simulate_ai_trigger(
+        worker_id=user_id,
+        user_id=user_id,
+        location_lat=location_lat,
+        location_lng=location_lng
+    )
+    
+    if result['status'] == 'error':
+        return jsonify(result), 500
+    
+    return jsonify({
+        'status': 'success',
+        'message': 'Emergency simulated successfully via AI pipeline',
+        'risk_score': result['risk_score'],
+        'risk_level': result['risk_level'],
+        'ai_status': result['ai_status'],
+        'reasons': result['risk_factors'],
+        'claim_triggered': result['claim_triggered'],
+        'claim_id': result['claim_id']
+    }), 200
+
+
+@app.route('/api/simulate-ai-trigger/<int:worker_id>', methods=['POST'])
+@token_required
+def simulate_ai_trigger_endpoint(user_id, role, worker_id):
+    """Test endpoint to simulate high-risk scenario and force AI claim creation."""
+    if role != 'admin':
+        return jsonify({'status': 'error', 'message': 'Admin access required'}), 403
+    
+    data = request.json if request.json else {}
+    location_lat = data.get('location_lat', 20.5937)
+    location_lng = data.get('location_lng', 78.9629)
+    
+    # Route through Agentic AI pipeline with maximum risk signals
+    result = simulate_ai_trigger(
+        worker_id=worker_id,
+        user_id=worker_id,
+        location_lat=location_lat,
+        location_lng=location_lng
+    )
+    
+    if result['status'] == 'error':
+        return jsonify(result), 500
+    
+    return jsonify({
+        'status': 'success',
+        'message': 'AI trigger test completed',
+        'worker_id': worker_id,
+        'risk_score': result['risk_score'],
+        'risk_level': result['risk_level'],
+        'ai_status': result['ai_status'],
+        'risk_factors': result['risk_factors'],
+        'claim_triggered': result['claim_triggered'],
+        'claim_id': result['claim_id'],
+        'decision': result['decision'],
+        'timestamp': result['timestamp']
+    }), 200
+
 
 if __name__ == '__main__':
     # You can specify a different port if needed. Port 5000 is default.
